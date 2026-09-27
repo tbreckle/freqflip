@@ -64,7 +64,7 @@ fn detect(wayland: bool, x11: bool, desktop: &str) -> Result<BackendKind> {
 
 #[cfg(target_os = "windows")]
 pub fn open(_kind: BackendKind) -> Result<Box<dyn Backend>> {
-    Ok(Box::new(windows::Windows))
+    Ok(Box::new(windows::Windows::default()))
 }
 
 #[cfg(target_os = "macos")]

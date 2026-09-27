@@ -196,7 +196,7 @@ The foreground call only returns after the background copy reports back, so erro
 
 | Platform | How the rate is switched | Tray |
 |---|---|---|
-| **Windows** 10/11 | `ChangeDisplaySettingsEx` (not saved: a reboot always brings back your normal rate) | Notification area |
+| **Windows** 10/11 | `SetDisplayConfig`, checked against the real signal timing (not saved: a reboot always brings back your normal rate) | Notification area |
 | **macOS** 11+ | Quartz Display Services, "for app only": macOS itself restores the rate when FreqFlip exits | Menu bar |
 | **Linux, X11** | XRandR | StatusNotifierItem |
 | **Linux, GNOME** (Wayland/X11) | Mutter D-Bus API, temporary config (never written to `monitors.xml`) | StatusNotifierItem¹ |
