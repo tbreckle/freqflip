@@ -1,0 +1,5 @@
+# Pinned toolchain for local builds and CI (tray-icon 0.25 needs Rust 1.90+).
+[toolchain]
+channel = "1.98"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

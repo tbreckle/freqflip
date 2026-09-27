@@ -1,0 +1,103 @@
+name: Release Start
+
+# Starts a GitFlow release or hotfix: computes the next version from the latest vX.Y.Z tag,
+# creates release/X.Y.Z (from develop) or hotfix/X.Y.Z (from main), moves the "Unreleased"
+# CHANGELOG entries into a X.Y.Z section and opens a pull request to main.
+# Merging that pull request runs release-finish.yml.
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: "release: from develop; hotfix: patch release from main"
+        required: true
+        default: release
+        type: choice
+        options:
+          - release
+          - hotfix
+      bump:
+        description: "Version part to increase (ignored for hotfixes, they always bump patch)"
+        required: true
+        default: minor
+        type: choice
+        options:
+          - minor
+          - major
+          - patch
+
+concurrency: release
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  start:
+    name: Start ${{ inputs.kind }}
+    runs-on: ubuntu-latest
+    env:
+      # Branches and PRs created with GITHUB_TOKEN don't trigger other workflows, so CI would
+      # not run on the release PR. A RELEASE_TOKEN secret (fine-grained PAT or GitHub App token
+      # with contents + pull-requests write) avoids that.
+      GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+      KIND: ${{ inputs.kind }}
+      BUMP: ${{ inputs.bump }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create branch
+        id: branch
+        run: |
+          if [[ "$KIND" == "hotfix" ]]; then
+            base="main"
+            bump="patch"
+          else
+            base="develop"
+            bump=$BUMP
+          fi
+          version=$(scripts/version.sh next "$bump")
+          branch="$KIND/$version"
+
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "::error::Branch $branch already exists."
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "::error::Tag v$version already exists."
+            exit 1
+          fi
+
+          git switch -c "$branch" "origin/$base"
+          scripts/changelog.sh release "$version"
+          git commit -am "Starts $KIND $version."
+          git push -u origin "$branch"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "Created \`$branch\` from \`$base\`." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open pull request to main
+        env:
+          VERSION: ${{ steps.branch.outputs.version }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+        run: |
+          trap 'echo "::error::Could not open the release PR. Enable \"Allow GitHub Actions to create and approve pull requests\" or set RELEASE_TOKEN (see .github/WORKFLOWS.md), or open it manually: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/main...$BRANCH"' ERR
+          gh pr create --base main --head "$BRANCH" --title "Release $VERSION" --body "$(cat <<EOF
+          Release **$VERSION** ($KIND).
+
+          - CI builds this branch as \`$VERSION-rc.N\`.
+          - Check the \`[$VERSION]\` section in CHANGELOG.md; it becomes the release notes.
+          - Only fixes for this release go onto \`$BRANCH\`.
+          - Merge with **Create a merge commit** (no squash/rebase). This tags \`v$VERSION\`, builds
+            and publishes the GitHub Release, and opens a back-merge PR into \`develop\`.
+          EOF
+          )"

@@ -1,0 +1,52 @@
+name: CI
+
+# Builds and tests every GitFlow branch and every PR to main/develop. The version follows the
+# branch (scripts/version.sh): release/hotfix branches build X.Y.Z-rc.N, everything else builds
+# 0.0.0+<sha>. Official X.Y.Z builds are made by release-finish.yml.
+on:
+  push:
+    branches:
+      - develop
+      - "feature/**"
+      - "bugfix/**"
+      - "release/**"
+      - "hotfix/**"
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history and tags for version.sh. For PRs, the branch tip instead of the
+          # merge commit, so the version matches the push build of the same commit.
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Compute version
+        id: version
+        run: |
+          version=$(scripts/version.sh --github)
+          echo "Version: \`$version\`" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build
+    needs: version
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.version.outputs.version }}

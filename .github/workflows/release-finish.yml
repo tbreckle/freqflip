@@ -1,0 +1,160 @@
+name: Release Finish
+
+# Runs when a release/X.Y.Z or hotfix/X.Y.Z pull request is merged into main: builds X.Y.Z from
+# the merge commit, tags it vX.Y.Z together with the GitHub Release, and opens a back-merge
+# pull request into develop. develop is protected and must be up to date for merging, so the
+# back-merge goes through backmerge/X.Y.Z (main's merge commit with develop merged in).
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - closed
+
+concurrency: release
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Version
+    if: >-
+      github.event.pull_request.merged &&
+      (startsWith(github.head_ref, 'release/') || startsWith(github.head_ref, 'hotfix/'))
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Version from branch name
+        id: version
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          version=${HEAD_REF#*/}
+          if ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Branch $HEAD_REF is not named release/X.Y.Z or hotfix/X.Y.Z."
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "::error::Tag v$version already exists."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Release: \`$version\`" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build
+    needs: version
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+  publish:
+    name: Publish
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      SHA: ${{ github.event.pull_request.merge_commit_sha }}
+      HEAD_REF: ${{ github.head_ref }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          # See release-start.yml: with GITHUB_TOKEN, CI does not run on the back-merge PR.
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: freqflip-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      # Creating the release also creates the tag vX.Y.Z on the merge commit. Steps are
+      # idempotent, so a failed job can be re-run.
+      - name: Create GitHub Release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "Release v$VERSION exists, uploading missing assets."
+            gh release upload "v$VERSION" dist/* --clobber
+            exit 0
+          fi
+          scripts/changelog.sh notes "$VERSION" > notes.md
+          gh release create "v$VERSION" dist/* \
+            --target "$SHA" \
+            --title "FreqFlip $VERSION" \
+            --notes-file notes.md \
+            --generate-notes
+
+      - name: Open back-merge pull request into develop
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+        run: |
+          branch="backmerge/$VERSION"
+          if [[ -n "$(gh pr list --base develop --head "$branch" --state all --json number --jq '.[].number')" ]]; then
+            echo "Back-merge pull request for $branch exists already."
+            exit 0
+          fi
+
+          conflict=false
+          if ! git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            git switch -c "$branch" "$SHA"
+            if ! git merge --no-ff -m "Merges develop into $branch." origin/develop; then
+              git merge --abort
+              conflict=true
+            fi
+            git push origin "$branch"
+          fi
+
+          body="Brings the changes of \`$HEAD_REF\` (CHANGELOG section, fixes) back into \`develop\`.
+
+          - Merge with **Create a merge commit** (no squash/rebase), otherwise the next release PR conflicts.
+          - Check CHANGELOG.md: entries added to \`develop\` while the release was open belong under \`[Unreleased]\`, not \`[$VERSION]\`."
+          if [[ "$conflict" == true ]]; then
+            body+="
+
+          **Merging \`develop\` into this branch conflicted.** Resolve it locally:
+          \`\`\`bash
+          git fetch origin && git switch $branch && git merge origin/develop
+          # resolve, commit, push
+          \`\`\`"
+          fi
+          if ! gh pr create --base develop --head "$branch" --title "Merge $VERSION back into develop" --body "$body"; then
+            echo "::error::Could not open the back-merge PR. Enable \"Allow GitHub Actions to create and approve pull requests\" or set RELEASE_TOKEN (see .github/WORKFLOWS.md), then re-run the job, or open it manually: $GITHUB_SERVER_URL/$GH_REPO/compare/develop...$branch"
+            exit 1
+          fi
+
+      # The release is published at this point, so the branch goes even if the back-merge PR failed.
+      - name: Delete ${{ github.head_ref }}
+        if: ${{ !cancelled() && steps.release.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X DELETE "repos/$GH_REPO/git/refs/heads/$HEAD_REF" || echo "Branch already deleted."

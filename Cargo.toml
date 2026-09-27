@@ -1,0 +1,65 @@
+[package]
+name = "freqflip"
+version = "0.0.0"
+edition = "2021"
+description = "Flips the display refresh rate while a game runs and flips it back when it exits"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+clap = { version = "4.6", features = ["derive"] }
+ctrlc = { version = "3.5", features = ["termination"] }
+png = "0.18"
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# KSNI on Linux: the tray talks D-Bus directly (StatusNotifierItem), no GTK, libxdo or
+# libappindicator needed.
+tray-icon = { version = "0.25", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+x11rb = { version = "0.14", features = ["randr"] }
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+
+# Windows and macOS need a native event loop on the main thread for the tray icon.
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+tao = { version = "0.37", default-features = false, features = ["rwh_06"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+core-foundation = "0.10"
+core-graphics = "0.25"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
+
+[build-dependencies]
+# Only used when the target is Windows (see build.rs); a plain build-dependency so build.rs
+# can decide by CARGO_CFG_TARGET_OS instead of the host.
+winresource = "0.1"
+
+[profile.dev]
+opt-level = 0              # No optimization.
+debug = "line-tables-only"
+strip = false              # Keep symbols.
+debug-assertions = true
+overflow-checks = true
+incremental = true         # Faster recompilation.
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+opt-level = 'z'   # Optimize for size.
+lto = true        # Enable Link Time Optimization.
+codegen-units = 1 # Better optimization.
+strip = true      # Strip symbols.
+panic = 'abort'   # Smaller panic handler.

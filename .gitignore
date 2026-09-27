@@ -1,0 +1,23 @@
+# Rust/Cargo
+target/
+**/*.rs.bk
+
+# Build artifacts
+dist/
+
+# Python (images/generate.py)
+__pycache__/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.log

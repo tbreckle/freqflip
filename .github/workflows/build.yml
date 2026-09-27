@@ -1,0 +1,175 @@
+name: Build
+
+# Reusable build of the app with an injected version (see scripts/version.sh).
+# Called by ci.yml for every push/PR and by release-finish.yml for official releases.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version to inject, e.g. 1.2.0, 1.2.0-rc.3 or 0.0.0+abc1234"
+        required: true
+        type: string
+      ref:
+        description: "Commit to build (defaults to the commit of the calling event)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  app:
+    name: App (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            archive: tar.gz
+          - name: windows-x86_64
+            os: windows-latest
+            archive: zip
+          - name: macos-universal
+            os: macos-latest
+            archive: tar.gz
+    env:
+      FREQFLIP_VERSION: ${{ inputs.version }}
+      PACKAGE: freqflip-${{ inputs.version }}-${{ matrix.name }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      # No system packages needed on Linux: X11 (x11rb), D-Bus (zbus) and the tray (KSNI)
+      # are pure Rust.
+
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          fi
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Run tests
+        run: cargo test --locked --release
+
+      - name: Build
+        if: runner.os != 'macOS'
+        run: cargo build --locked --release
+
+      - name: Build universal binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create -output target/release/freqflip \
+            target/aarch64-apple-darwin/release/freqflip \
+            target/x86_64-apple-darwin/release/freqflip
+
+      # Archive on the runner: upload-artifact drops the executable bit.
+      - name: Package
+        run: |
+          rm -rf dist
+          mkdir -p "dist/$PACKAGE"
+          cp LICENSE README.md "dist/$PACKAGE/"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp target/release/freqflip.exe "dist/$PACKAGE/"
+            (cd dist && pwsh -NoProfile -Command "Compress-Archive -Path '$PACKAGE' -DestinationPath '$PACKAGE.zip'")
+          else
+            cp target/release/freqflip "dist/$PACKAGE/"
+            tar -C dist -czf "dist/$PACKAGE.tar.gz" "$PACKAGE"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PACKAGE }}
+          path: dist/${{ env.PACKAGE }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  clippy:
+    name: Clippy (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+          - name: windows
+            os: windows-latest
+          - name: macos
+            os: macos-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      # Installs the toolchain pinned in rust-toolchain.toml (incl. clippy and rustfmt).
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-clippy-
+
+      # Every platform has its own backend code, so lint on each of them.
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      # Installs the toolchain pinned in rust-toolchain.toml (incl. clippy and rustfmt).
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+  scripts:
+    name: Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Run shellcheck
+        run: shellcheck scripts/*.sh
+
+      - name: Test version and changelog scripts
+        run: scripts/test.sh
