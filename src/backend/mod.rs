@@ -18,9 +18,10 @@ mod wlr;
 #[cfg(target_os = "linux")]
 mod x11;
 
-/// Opens the display backend for this platform. `kind` only matters on Linux.
+/// Opens the display backend for this platform. `kind` only matters on Linux, `save` (store the
+/// mode in the display settings) only on Windows.
 #[cfg(target_os = "linux")]
-pub fn open(kind: BackendKind) -> Result<Box<dyn Backend>> {
+pub fn open(kind: BackendKind, _save: bool) -> Result<Box<dyn Backend>> {
     use anyhow::bail;
     use std::env;
 
@@ -63,12 +64,12 @@ fn detect(wayland: bool, x11: bool, desktop: &str) -> Result<BackendKind> {
 }
 
 #[cfg(target_os = "windows")]
-pub fn open(_kind: BackendKind) -> Result<Box<dyn Backend>> {
-    Ok(Box::new(windows::Windows::default()))
+pub fn open(_kind: BackendKind, save: bool) -> Result<Box<dyn Backend>> {
+    Ok(Box::new(windows::Windows::new(save)))
 }
 
 #[cfg(target_os = "macos")]
-pub fn open(_kind: BackendKind) -> Result<Box<dyn Backend>> {
+pub fn open(_kind: BackendKind, _save: bool) -> Result<Box<dyn Backend>> {
     Ok(Box::new(macos::MacOs))
 }
 

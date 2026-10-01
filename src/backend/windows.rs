@@ -5,8 +5,11 @@
 //! even read back the new rate, while the monitor keeps running at the old one. So every switch
 //! is checked against the signal timing CCD reports (and the resolution GDI reports).
 //!
-//! Nothing is saved to the display database / registry, so a reboot always brings back the
-//! saved mode even if FreqFlip is killed.
+//! By default nothing is saved to the display database / registry, so a reboot always brings
+//! back the saved mode even if FreqFlip is killed. But programs that reset the display to its
+//! saved mode (`ChangeDisplaySettings(NULL, 0)`, as some emulators do at startup) undo such a
+//! temporary switch; `--save` stores the mode like the Settings app does, and the original back
+//! on restore.
 
 use std::collections::HashMap;
 use std::mem;
@@ -20,14 +23,16 @@ use windows_sys::Win32::Devices::Display::{
     DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_RATIONAL, DISPLAYCONFIG_SCANLINE_ORDERING_INTERLACED,
     DISPLAYCONFIG_SCANLINE_ORDERING_INTERLACED_LOWERFIELDFIRST,
     DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
-    QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_SAVE_TO_DATABASE,
+    SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
 use windows_sys::Win32::Graphics::Gdi::{
-    ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, DEVMODEW,
-    DISPLAYCONFIG_PATH_MODE_IDX_INVALID, DISPLAY_DEVICEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP,
-    DISPLAY_DEVICE_PRIMARY_DEVICE, DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFLAGS, DM_DISPLAYFREQUENCY,
-    DM_INTERLACED, DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
+    ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_UPDATEREGISTRY,
+    DEVMODEW, DISPLAYCONFIG_PATH_MODE_IDX_INVALID, DISPLAY_DEVICEW,
+    DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICE_PRIMARY_DEVICE, DISP_CHANGE_SUCCESSFUL,
+    DM_DISPLAYFLAGS, DM_DISPLAYFREQUENCY, DM_INTERLACED, DM_PELSHEIGHT, DM_PELSWIDTH,
+    ENUM_CURRENT_SETTINGS,
 };
 
 use crate::display::{format_hz, Backend, Display, Mode, Resolution};
@@ -41,6 +46,17 @@ pub struct Windows {
     /// Exact rate each device ran at before the first switch, with its GDI mode, so restoring
     /// brings back the same timing (e.g. 164.96 Hz, not whatever Windows picks for "165").
     originals: HashMap<String, (Mode, DISPLAYCONFIG_RATIONAL)>,
+    /// Save each mode to the display database / registry (`--save`).
+    save: bool,
+}
+
+impl Windows {
+    pub fn new(save: bool) -> Self {
+        Self {
+            save,
+            ..Self::default()
+        }
+    }
 }
 
 const DEVICE_PREFIX: &str = r"\\.\";
@@ -192,11 +208,11 @@ impl Backend for Windows {
             _ => candidates(hz).to_vec(),
         };
 
-        let ccd_err = match ccd_set(&device, &rates, mode) {
+        let ccd_err = match ccd_set(&device, &rates, mode, self.save) {
             Ok(()) => return Ok(()),
             Err(e) => e,
         };
-        gdi_set(&device, mode).with_context(|| format!("{ccd_err:#}"))?;
+        gdi_set(&device, mode, self.save).with_context(|| format!("{ccd_err:#}"))?;
         if let Some(actual) = gdi_resolution(&device) {
             if actual != mode.resolution() {
                 bail!(
@@ -335,9 +351,14 @@ fn source_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<String> {
 
 /// Sets `device` to `mode` with SetDisplayConfig, trying `rates` in order until the monitor
 /// runs at the mode's rate. The resolution goes into the source (desktop) mode; the target mode
-/// is dropped from the path, so Windows picks the monitor timing for the new rate.
-fn ccd_set(device: &str, rates: &[DISPLAYCONFIG_RATIONAL], mode: &Mode) -> Result<()> {
+/// is dropped from the path, so Windows picks the monitor timing for the new rate. With `save`
+/// the result is stored in the display database.
+fn ccd_set(device: &str, rates: &[DISPLAYCONFIG_RATIONAL], mode: &Mode, save: bool) -> Result<()> {
     let want = mode.refresh;
+    let mut flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES;
+    if save {
+        flags |= SDC_SAVE_TO_DATABASE;
+    }
     let mut last_err = anyhow::anyhow!("no rate to try");
     for &rate in rates {
         let mut config = DisplayConfig::query()?;
@@ -381,7 +402,7 @@ fn ccd_set(device: &str, rates: &[DISPLAYCONFIG_RATIONAL], mode: &Mode) -> Resul
                 config.paths.as_ptr(),
                 config.modes.len() as u32,
                 config.modes.as_ptr(),
-                SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
+                flags,
             )
         };
         if err != 0 {
@@ -409,8 +430,8 @@ fn ccd_set(device: &str, rates: &[DISPLAYCONFIG_RATIONAL], mode: &Mode) -> Resul
     Err(last_err)
 }
 
-/// Fallback: the legacy GDI mode change, not saved to the registry.
-fn gdi_set(device: &str, mode: &Mode) -> Result<()> {
+/// Fallback: the legacy GDI mode change, saved to the registry only with `save`.
+fn gdi_set(device: &str, mode: &Mode, save: bool) -> Result<()> {
     let device = wide(device);
     let Some(mut dm) = enum_settings(&device, ENUM_CURRENT_SETTINGS) else {
         bail!("display not found");
@@ -420,9 +441,11 @@ fn gdi_set(device: &str, mode: &Mode) -> Result<()> {
     dm.dmDisplayFrequency = mode.refresh.round() as u32;
     dm.Anonymous2.dmDisplayFlags = if mode.interlaced { DM_INTERLACED } else { 0 };
     dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_DISPLAYFLAGS;
+    let flags = if save { CDS_UPDATEREGISTRY } else { 0 };
     // SAFETY: `device` is NUL-terminated, `dm` is a complete DEVMODEW from the driver.
-    let result =
-        unsafe { ChangeDisplaySettingsExW(device.as_ptr(), &dm, ptr::null_mut(), 0, ptr::null()) };
+    let result = unsafe {
+        ChangeDisplaySettingsExW(device.as_ptr(), &dm, ptr::null_mut(), flags, ptr::null())
+    };
     if result != DISP_CHANGE_SUCCESSFUL {
         bail!("Windows refused the mode {} (error {result})", mode.id);
     }

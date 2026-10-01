@@ -146,12 +146,15 @@ freqflip --list
 | `-f, --foreground` | Don't return early, stay in the foreground until the rate is restored |
 | `--no-tray` | No tray icon |
 | `--log <FILE>` | Append progress messages to a file |
+| `--save` | Windows only: save the mode like the Settings app does, for emulators that reset the display to its saved mode at startup (see below) |
 | `-b, --backend <NAME>` | Linux only: `auto`, `x11`, `gnome`, `kde`, `wlr` |
 | `-l, --list` | List displays with their resolutions and refresh rates |
 
 **Modes:** without a resolution, the current one is kept and only the refresh rate changes. Without a rate, FreqFlip picks the one closest to the current rate at the new resolution. Color depth (Windows) and HiDPI scaling (macOS) are kept when the new resolution offers them.
 
 **Exit code:** `0` once the mode is switched (or already was right), `1` if it couldn't be switched. Errors are printed to stderr, so a script can bail out before starting the game.
+
+**`--save` (Windows):** FreqFlip's switch is temporary, Windows keeps your normal mode saved. Some emulators reset the display to that saved mode when they start, which undoes the switch (switching in the Settings app works because it saves the mode). `--save` saves the switched mode too and saves your normal mode back on restore. If FreqFlip is killed (`taskkill /F`) or Windows crashes before that, the switched mode stays saved until you change it back.
 
 **Names** are matched case-insensitively, with or without `.exe`, against the process name, its executable and its first argument. FreqFlip waits until **no** process with that name is left.
 
@@ -209,7 +212,7 @@ The foreground call only returns after the background copy reports back, so erro
 
 | Platform | How the mode is switched | Tray |
 |---|---|---|
-| **Windows** 10/11 | `SetDisplayConfig`, checked against the real signal timing (not saved: a reboot always brings back your normal mode) | Notification area |
+| **Windows** 10/11 | `SetDisplayConfig`, checked against the real signal timing (not saved: a reboot always brings back your normal mode; `--save` saves it for emulators that would reset it) | Notification area |
 | **macOS** 11+ | Quartz Display Services, "for app only": macOS itself restores the mode when FreqFlip exits | Menu bar |
 | **Linux, X11** | XRandR; a new resolution resizes the screen like `xrandr` does | StatusNotifierItem |
 | **Linux, GNOME** (Wayland/X11) | Mutter D-Bus API, temporary config (never written to `monitors.xml`); monitors right of or below a resized one move along | StatusNotifierItem¹ |

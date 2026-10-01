@@ -62,6 +62,13 @@ pub struct Args {
     #[arg(long, value_name = "FILE")]
     pub log: Option<PathBuf>,
 
+    /// Windows only: also save the mode in the display settings, like the Settings app does,
+    /// for programs that reset the display to its saved mode at startup (some emulators). The
+    /// original mode is saved back on restore; if FreqFlip is killed or Windows crashes first,
+    /// the switched mode stays saved.
+    #[arg(long)]
+    pub save: bool,
+
     /// Display backend (Linux only; auto picks X11, GNOME, KDE or wlroots from the session).
     #[arg(short, long, value_enum, default_value_t = BackendKind::Auto)]
     pub backend: BackendKind,

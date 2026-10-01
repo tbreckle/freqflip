@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `--save` (Windows): saves the switched mode like the Settings app does and saves the original back on restore, so emulators that reset the display to its saved mode at startup keep the switched one
 - The mode argument also takes a resolution: `640x480@60` switches resolution and rate, `1920x1080` only the resolution (at the rate closest to the current one), `640x480i` picks an interlaced mode; color depth (Windows) and HiDPI scale (macOS) are kept if possible
 - `--list` shows every resolution with its refresh rates
 - X11 resizes the screen to fit a new resolution; GNOME moves monitors right of or below a resized one and picks a scale the new mode supports

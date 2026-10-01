@@ -20,7 +20,7 @@ const RESTORE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// `freqflip --list`
 pub fn list(args: &Args) -> Result<()> {
-    let mut backend = backend::open(args.backend)?;
+    let mut backend = backend::open(args.backend, args.save)?;
     let displays = backend.displays()?;
     println!("Backend: {}", backend.name());
     if displays.is_empty() {
@@ -73,6 +73,9 @@ struct Flip {
     backend: Box<dyn Backend>,
     display: String,
     original: Mode,
+    /// The mode was saved (`--save`), so the original has to be saved back even when the
+    /// display already runs at it again.
+    saved: bool,
     restored: bool,
 }
 
@@ -82,10 +85,11 @@ impl Flip {
             return Ok(());
         }
         self.restored = true;
-        if self
-            .backend
-            .current_mode(&self.display)
-            .is_ok_and(|current| current == self.original)
+        if !self.saved
+            && self
+                .backend
+                .current_mode(&self.display)
+                .is_ok_and(|current| current == self.original)
         {
             return Ok(());
         }
@@ -195,7 +199,7 @@ pub fn run(args: &Args, reporter: &Reporter) -> Result<i32> {
     let target = Target::parse(args.process.as_deref().context("no process given")?)?;
     process::check(&target)?;
 
-    let mut backend = backend::open(args.backend)?;
+    let mut backend = backend::open(args.backend, args.save)?;
     let display = select_display(backend.displays()?, args.display.as_deref())?;
     let mode = pick_mode(&display, &request, args.tolerance)?;
     let original = display.current.clone();
@@ -221,6 +225,7 @@ pub fn run(args: &Args, reporter: &Reporter) -> Result<i32> {
         backend,
         display: display.id.clone(),
         original: original.clone(),
+        saved: args.save,
         restored: false,
     };
     let current = flip
