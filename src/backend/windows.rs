@@ -1,12 +1,12 @@
-//! Windows backend: displays and modes come from GDI (EnumDisplaySettingsW), rates are set
+//! Windows backend: displays and modes come from GDI (EnumDisplaySettingsW), modes are set
 //! through the CCD API (SetDisplayConfig) like the Settings app does.
 //!
 //! ChangeDisplaySettingsExW is only a fallback: on current Windows it can report success, and
 //! even read back the new rate, while the monitor keeps running at the old one. So every switch
-//! is checked against the signal timing CCD reports.
+//! is checked against the signal timing CCD reports (and the resolution GDI reports).
 //!
 //! Nothing is saved to the display database / registry, so a reboot always brings back the
-//! saved rate even if FreqFlip is killed.
+//! saved mode even if FreqFlip is killed.
 
 use std::collections::HashMap;
 use std::mem;
@@ -16,9 +16,11 @@ use anyhow::{bail, Context, Result};
 use windows_sys::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig, SetDisplayConfig,
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO,
-    DISPLAYCONFIG_MODE_INFO_TYPE_TARGET, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_RATIONAL,
-    DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY,
-    SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_MODE_INFO_TYPE_TARGET,
+    DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_RATIONAL, DISPLAYCONFIG_SCANLINE_ORDERING_INTERLACED,
+    DISPLAYCONFIG_SCANLINE_ORDERING_INTERLACED_LOWERFIELDFIRST,
+    DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+    QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -28,7 +30,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     DM_INTERLACED, DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
 };
 
-use crate::display::{format_hz, Backend, Display, Mode};
+use crate::display::{format_hz, Backend, Display, Mode, Resolution};
 
 /// GDI rates are whole numbers (59.94 Hz shows up as 59), so the rate the monitor really runs
 /// at may be up to this far off.
@@ -36,9 +38,9 @@ const RATE_TOLERANCE: f64 = 1.0;
 
 #[derive(Default)]
 pub struct Windows {
-    /// Exact rate each device ran at before the first switch, with its GDI rate, so restoring
+    /// Exact rate each device ran at before the first switch, with its GDI mode, so restoring
     /// brings back the same timing (e.g. 164.96 Hz, not whatever Windows picks for "165").
-    originals: HashMap<String, (u32, DISPLAYCONFIG_RATIONAL)>,
+    originals: HashMap<String, (Mode, DISPLAYCONFIG_RATIONAL)>,
 }
 
 const DEVICE_PREFIX: &str = r"\\.\";
@@ -177,20 +179,32 @@ impl Backend for Windows {
                 .and_then(|config| config.rational(&device));
             let gdi = enum_settings(&wide(&device), ENUM_CURRENT_SETTINGS);
             if let (Some(rate), Some(dm)) = (rate, gdi) {
-                self.originals
-                    .insert(device.clone(), (dm.dmDisplayFrequency, rate));
+                self.originals.insert(device.clone(), (to_mode(&dm), rate));
             }
         }
         let rates = match self.originals.get(&device) {
-            Some(&(gdi_hz, rate)) if gdi_hz == hz => vec![rate],
+            Some((original, rate))
+                if original.refresh.round() as u32 == hz
+                    && original.resolution() == mode.resolution() =>
+            {
+                vec![*rate]
+            }
             _ => candidates(hz).to_vec(),
         };
 
-        let ccd_err = match ccd_set(&device, &rates, mode.refresh) {
+        let ccd_err = match ccd_set(&device, &rates, mode) {
             Ok(()) => return Ok(()),
             Err(e) => e,
         };
         gdi_set(&device, mode).with_context(|| format!("{ccd_err:#}"))?;
+        if let Some(actual) = gdi_resolution(&device) {
+            if actual != mode.resolution() {
+                bail!(
+                    "Windows reports {} as set, but {display} still runs at {actual} ({ccd_err:#})",
+                    mode.resolution()
+                );
+            }
+        }
         // Trust the signal timing, not the call's result (see the module docs).
         if let Some(actual) = DisplayConfig::query()
             .ok()
@@ -302,6 +316,11 @@ impl DisplayConfig {
     }
 }
 
+/// The current resolution of a GDI device.
+fn gdi_resolution(device: &str) -> Option<Resolution> {
+    enum_settings(&wide(device), ENUM_CURRENT_SETTINGS).map(|dm| to_mode(&dm).resolution())
+}
+
 /// The GDI device name (`\\.\DISPLAY1`) of a path's source.
 fn source_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<String> {
     let mut name = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
@@ -314,10 +333,11 @@ fn source_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<String> {
     (err == 0).then(|| from_wide(&name.viewGdiDeviceName))
 }
 
-/// Sets the rate of `device` with SetDisplayConfig, trying `rates` in order until the monitor
-/// runs at `want` Hz. The target mode is dropped from the path, so Windows picks the monitor
-/// timing for the new rate.
-fn ccd_set(device: &str, rates: &[DISPLAYCONFIG_RATIONAL], want: f64) -> Result<()> {
+/// Sets `device` to `mode` with SetDisplayConfig, trying `rates` in order until the monitor
+/// runs at the mode's rate. The resolution goes into the source (desktop) mode; the target mode
+/// is dropped from the path, so Windows picks the monitor timing for the new rate.
+fn ccd_set(device: &str, rates: &[DISPLAYCONFIG_RATIONAL], mode: &Mode) -> Result<()> {
+    let want = mode.refresh;
     let mut last_err = anyhow::anyhow!("no rate to try");
     for &rate in rates {
         let mut config = DisplayConfig::query()?;
@@ -329,6 +349,29 @@ fn ccd_set(device: &str, rates: &[DISPLAYCONFIG_RATIONAL], want: f64) -> Result<
             let path = &mut config.paths[i];
             path.targetInfo.refreshRate = rate;
             path.targetInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+            let interlaced = matches!(
+                path.targetInfo.scanLineOrdering,
+                DISPLAYCONFIG_SCANLINE_ORDERING_INTERLACED
+                    | DISPLAYCONFIG_SCANLINE_ORDERING_INTERLACED_LOWERFIELDFIRST
+            );
+            if interlaced != mode.interlaced {
+                path.targetInfo.scanLineOrdering = if mode.interlaced {
+                    DISPLAYCONFIG_SCANLINE_ORDERING_INTERLACED
+                } else {
+                    DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE
+                };
+            }
+            // SAFETY: without QDC_VIRTUAL_MODE_AWARE the union holds the plain mode index.
+            let index = unsafe { path.sourceInfo.Anonymous.modeInfoIdx };
+            if let Some(source) = config
+                .modes
+                .get_mut(index as usize)
+                .filter(|m| m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+            {
+                // infoType says the union holds a source mode.
+                source.Anonymous.sourceMode.width = mode.width;
+                source.Anonymous.sourceMode.height = mode.height;
+            }
         }
         // Without SDC_SAVE_TO_DATABASE the change is temporary.
         // SAFETY: the counts match the arrays, which come from QueryDisplayConfig.
@@ -342,7 +385,14 @@ fn ccd_set(device: &str, rates: &[DISPLAYCONFIG_RATIONAL], want: f64) -> Result<
             )
         };
         if err != 0 {
-            last_err = anyhow::anyhow!("SetDisplayConfig refused the rate (error {err})");
+            last_err = anyhow::anyhow!("SetDisplayConfig refused the mode (error {err})");
+            continue;
+        }
+        if let Some(actual) = gdi_resolution(device).filter(|&r| r != mode.resolution()) {
+            last_err = anyhow::anyhow!(
+                "SetDisplayConfig picked {actual} instead of {}",
+                mode.resolution()
+            );
             continue;
         }
         match DisplayConfig::query()?.refresh(device) {

@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- The mode argument also takes a resolution: `640x480@60` switches resolution and rate, `1920x1080` only the resolution (at the rate closest to the current one), `640x480i` picks an interlaced mode; color depth (Windows) and HiDPI scale (macOS) are kept if possible
+- `--list` shows every resolution with its refresh rates
+- X11 resizes the screen to fit a new resolution; GNOME moves monitors right of or below a resized one and picks a scale the new mode supports
 - `freqflip HZ PROCESS` switches a display to the refresh rate closest to `HZ` (within `--tolerance`, same resolution), returns once it is switched and restores the original rate in the background when the process (name or PID) exits
 - Named processes may start later (`--start-timeout`); a short grace period covers games that restart themselves
 - Tray icon with tooltip and menu showing target, original and current rate and the watched process; "Restore and exit" ends early

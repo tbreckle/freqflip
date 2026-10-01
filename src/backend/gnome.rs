@@ -1,6 +1,8 @@
 //! GNOME backend: Mutter's org.gnome.Mutter.DisplayConfig D-Bus API (Wayland and X11).
 //!
 //! Changes are applied with the "temporary" method, so GNOME never saves them to monitors.xml.
+//! A new resolution resizes the display's logical monitor; monitors right of or below it move
+//! along, because Mutter refuses layouts with gaps or overlaps.
 
 use std::collections::HashMap;
 
@@ -13,6 +15,9 @@ use crate::display::{Backend, Display, Mode};
 const DEST: &str = "org.gnome.Mutter.DisplayConfig";
 const PATH: &str = "/org/gnome/Mutter/DisplayConfig";
 const METHOD_TEMPORARY: u32 = 1;
+const LAYOUT_MODE_PHYSICAL: u32 = 2;
+/// Mutter's supported scales are floats computed from the mode size.
+const SCALE_EPSILON: f64 = 1e-4;
 
 type Props = HashMap<String, OwnedValue>;
 /// (connector, vendor, product, serial)
@@ -30,6 +35,9 @@ type ApplyLogicalMonitor<'a> = (i32, i32, f64, u32, bool, Vec<ApplyMonitor<'a>>)
 
 pub struct Gnome {
     conn: Connection,
+    /// Scale of each display's logical monitor before the first switch, to restore it with the
+    /// original mode if another resolution needed another scale.
+    original_scales: HashMap<String, f64>,
 }
 
 fn prop_bool(props: &Props, key: &str) -> bool {
@@ -61,10 +69,63 @@ fn current_mode(monitor: &Monitor) -> Option<&MutterMode> {
     monitor.1.iter().find(|m| prop_bool(&m.6, "is-current"))
 }
 
+/// The scale for a mode: the original scale of the logical monitor if the mode supports it,
+/// else the current one, else the mode's preferred scale (Mutter only takes supported scales).
+fn pick_scale(original: f64, current: f64, supported: &[f64], preferred: f64) -> f64 {
+    if supported.is_empty() {
+        return current;
+    }
+    [original, current]
+        .iter()
+        .find_map(|&scale| {
+            supported
+                .iter()
+                .copied()
+                .find(|s| (s - scale).abs() < SCALE_EPSILON)
+        })
+        .unwrap_or(preferred)
+}
+
+/// Size of a logical monitor showing a `width` x `height` mode. Transforms 1, 3, 5 and 7 rotate
+/// by 90 or 270 degrees; in the logical layout mode the size is divided by the scale.
+fn logical_size(width: i32, height: i32, scale: f64, transform: u32, physical: bool) -> (i32, i32) {
+    let (width, height) = if transform % 2 == 1 {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    if physical || scale <= 0.0 {
+        (width, height)
+    } else {
+        (
+            (f64::from(width) / scale).round() as i32,
+            (f64::from(height) / scale).round() as i32,
+        )
+    }
+}
+
+/// New position of a logical monitor at `position` when the one at `resized` changes from
+/// `old` to `new` size: monitors right of or below it move along, so they keep touching it.
+fn shift(
+    position: (i32, i32),
+    resized: (i32, i32),
+    old: (i32, i32),
+    new: (i32, i32),
+) -> (i32, i32) {
+    let along = |p: i32, r: i32, o: i32, n: i32| if p >= r + o { p + n - o } else { p };
+    (
+        along(position.0, resized.0, old.0, new.0),
+        along(position.1, resized.1, old.1, new.1),
+    )
+}
+
 impl Gnome {
     pub fn open() -> Result<Self> {
         let conn = Connection::session().context("could not connect to the D-Bus session bus")?;
-        let gnome = Self { conn };
+        let gnome = Self {
+            conn,
+            original_scales: HashMap::new(),
+        };
         gnome
             .state()
             .context("GNOME/Mutter display configuration is not available")?;
@@ -109,14 +170,37 @@ impl Backend for Gnome {
 
     fn set_mode(&mut self, display: &str, mode: &Mode) -> Result<()> {
         let (serial, monitors, logical, props) = self.state()?;
-        if !monitors.iter().any(|m| m.0 .0 == display) {
+        let Some(monitor) = monitors.iter().find(|m| m.0 .0 == display) else {
             bail!("display {display} not found");
-        }
+        };
+        let old_mode =
+            current_mode(monitor).with_context(|| format!("{display} has no current mode"))?;
+        let new_mode = monitor
+            .1
+            .iter()
+            .find(|m| m.0 == mode.id)
+            .with_context(|| format!("mode {} is no longer available", mode.id))?;
+        let ours = logical
+            .iter()
+            .position(|l| l.5.iter().any(|spec| spec.0 == display))
+            .with_context(|| format!("{display} is not part of the desktop"))?;
+
+        // The new size of our logical monitor, and with it the new scale.
+        let (x0, y0, scale, transform, ..) = logical[ours];
+        let original_scale = *self
+            .original_scales
+            .entry(display.to_string())
+            .or_insert(scale);
+        let new_scale = pick_scale(original_scale, scale, &new_mode.5, new_mode.4);
+        let physical = props.get("layout-mode").and_then(|v| u32::try_from(v).ok())
+            == Some(LAYOUT_MODE_PHYSICAL);
+        let old_size = logical_size(old_mode.1, old_mode.2, scale, transform, physical);
+        let new_size = logical_size(new_mode.1, new_mode.2, new_scale, transform, physical);
 
         // Mutter only takes complete configurations: re-send the current layout with the
         // new mode for our connector.
         let mut config: Vec<ApplyLogicalMonitor> = Vec::new();
-        for (x, y, scale, transform, primary, specs, _) in &logical {
+        for (index, (x, y, scale, transform, primary, specs, _)) in logical.iter().enumerate() {
             let mut members = Vec::new();
             for spec in specs {
                 let monitor = monitors
@@ -144,7 +228,12 @@ impl Backend for Gnome {
                 }
                 members.push((spec.0.clone(), mode_id, monitor_props));
             }
-            config.push((*x, *y, *scale, *transform, *primary, members));
+            let ((x, y), scale) = if index == ours {
+                ((*x, *y), new_scale)
+            } else {
+                (shift((*x, *y), (x0, y0), old_size, new_size), *scale)
+            };
+            config.push((x, y, scale, *transform, *primary, members));
         }
 
         let mut apply_props: HashMap<String, Value> = HashMap::new();
@@ -164,5 +253,41 @@ impl Backend for Gnome {
             )
             .context("Mutter refused the configuration")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picks_supported_scale() {
+        let supported = [1.0, 1.25, 1.5, 2.0];
+        assert_eq!(pick_scale(1.25, 1.0, &supported, 1.0), 1.25);
+        assert_eq!(pick_scale(1.75, 1.5, &supported, 1.0), 1.5);
+        assert_eq!(pick_scale(1.75, 1.75, &supported, 2.0), 2.0);
+        assert_eq!(pick_scale(1.75, 1.5000001, &supported, 1.0), 1.5);
+        assert_eq!(pick_scale(2.0, 1.5, &[], 1.0), 1.5);
+    }
+
+    #[test]
+    fn computes_logical_size() {
+        assert_eq!(logical_size(2560, 1440, 2.0, 0, false), (1280, 720));
+        assert_eq!(logical_size(2560, 1440, 2.0, 0, true), (2560, 1440));
+        assert_eq!(logical_size(1920, 1080, 1.0, 1, false), (1080, 1920));
+        assert_eq!(logical_size(1920, 1080, 1.0, 7, false), (1080, 1920));
+        assert_eq!(logical_size(1920, 1080, 1.0, 6, false), (1920, 1080));
+    }
+
+    #[test]
+    fn shifts_neighbors() {
+        let (old, new) = ((2560, 1440), (1920, 1080));
+        // Right of and below the resized monitor at the origin.
+        assert_eq!(shift((2560, 0), (0, 0), old, new), (1920, 0));
+        assert_eq!(shift((0, 1440), (0, 0), old, new), (0, 1080));
+        assert_eq!(shift((2560, 1440), (0, 0), old, new), (1920, 1080));
+        // Left of it: unchanged; and back again on restore.
+        assert_eq!(shift((0, 0), (1920, 0), old, new), (0, 0));
+        assert_eq!(shift((1920, 0), (0, 0), new, old), (2560, 0));
     }
 }

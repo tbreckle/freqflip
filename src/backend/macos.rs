@@ -1,6 +1,6 @@
 //! macOS backend: Quartz Display Services.
 //!
-//! Modes are configured "for app only", so macOS itself restores the original rate when
+//! Modes are configured "for app only", so macOS itself restores the original mode when
 //! FreqFlip exits, even if it is killed.
 
 use anyhow::{anyhow, bail, Result};
@@ -27,6 +27,9 @@ fn all_modes(id: CGDirectDisplayID) -> Vec<CGDisplayMode> {
 }
 
 fn to_mode(mode: &CGDisplayMode) -> Mode {
+    // Pixels per point: 2 for HiDPI modes, 1 for native ones. At the same pixel size it tells
+    // the variants apart, and a resolution change keeps HiDPI on or off if it can.
+    let scale = mode.pixel_width() as f64 / mode.width().max(1) as f64;
     Mode {
         // The I/O Kit id plus the point size, which tells HiDPI and native variants apart.
         id: format!("{}:{}x{}", mode.mode_id(), mode.width(), mode.height()),
@@ -34,7 +37,7 @@ fn to_mode(mode: &CGDisplayMode) -> Mode {
         height: mode.pixel_height() as u32,
         refresh: mode.refresh_rate(),
         interlaced: false,
-        variant: format!("{}x{} pt", mode.width(), mode.height()),
+        variant: format!("{scale:.2}x"),
     }
 }
 

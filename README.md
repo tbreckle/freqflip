@@ -4,7 +4,7 @@
 
 ### Flip your display to the game's refresh rate, and back when you're done.
 
-**A tiny tray tool that switches your monitor to 60 Hz (or 50, or 59.94, or 120) for one game, waits for it to quit, and puts your original refresh rate back.**
+**A tiny tray tool that switches your monitor to 60 Hz (or 50, or 59.94, or 120, optionally at another resolution) for one game, waits for it to quit, and puts your original mode back.**
 
 [![CI](https://github.com/tbreckle/freqflip/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/tbreckle/freqflip/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/tbreckle/freqflip?sort=semver&color=ff3e6c&logo=github)](https://github.com/tbreckle/freqflip/releases)
@@ -39,6 +39,8 @@ freqflip 60 mame
 3. 👀 Sits in the **tray** and waits for `mame` to start and then to exit
 4. ✅ Flips back to your **original rate**
 
+Need another resolution as well? `freqflip 640x480@60 mame`.
+
 ## ✨ Features
 
 <table>
@@ -47,7 +49,7 @@ freqflip 60 mame
 
 #### 🔀 Flipping
 - **Any rate the display offers**: 50, 59.94, 60, 120 Hz, ... matched within a tolerance
-- **Resolution stays put**: only the refresh rate changes
+- **Resolution too, if you want**: `640x480@60`, or just `1920x1080`; otherwise it stays put
 - **Any display**: the primary one by default, or pick one with `--display`
 - **Always restores**: on process exit, from the tray menu, on Ctrl+C / SIGTERM, and when the game never shows up
 
@@ -66,7 +68,7 @@ freqflip 60 mame
 <td width="50%" valign="top">
 
 #### 🖥️ Tray icon
-- **Tooltip and menu** show the target, original and current rate, plus the watched process
+- **Tooltip and menu** show the target, original and current rate (and resolution), plus the watched process
 - **"Restore and exit"** gives you the original rate back early
 - **`--no-tray`** for headless setups
 
@@ -105,7 +107,9 @@ freqflip 60 mame
 
    * DisplayPort-2 [primary]
        current:   2560x1440 @ 164.96 Hz
-       available: 164.96 Hz, 143.97 Hz, 120 Hz, 99.95 Hz, 59.95 Hz
+       available: 2560x1440   164.96 Hz, 143.97 Hz, 120 Hz, 99.95 Hz, 59.95 Hz
+                  1920x1080   120 Hz, 119.88 Hz, 100 Hz, 60 Hz, 59.94 Hz, 50 Hz
+                  640x480     60 Hz, 59.94 Hz
    ```
 
 3. **Flip it:**
@@ -115,19 +119,26 @@ freqflip 60 mame
    DisplayPort-2: 164.96 Hz -> 59.95 Hz, restoring when mame exits
    ```
 
+   Or with another resolution:
+
+   ```console
+   $ freqflip 640x480@60 mame
+   DisplayPort-2: 2560x1440 @ 164.96 Hz -> 640x480 @ 60 Hz, restoring when mame exits
+   ```
+
 > [!TIP]
 > `59.95` was picked for `60` because it's within the default tolerance of 0.5 Hz. Use `--tolerance` to be stricter or looser.
 
 ## ⌨️ Usage
 
 ```
-freqflip [OPTIONS] <HZ> <PROCESS>
+freqflip [OPTIONS] <MODE> <PROCESS>
 freqflip --list
 ```
 
 | Argument / option | Meaning |
 |---|---|
-| `HZ` | Target refresh rate, e.g. `60` or `59.94` |
+| `MODE` | Target refresh rate (`60`, `59.94`), resolution (`1920x1080`, `640x480i` for interlaced) or both (`640x480@60`) |
 | `PROCESS` | Process to wait for: a name (`mame`, `mame.exe`) or a PID |
 | `-d, --display <ID>` | Display to switch, as shown by `--list` (default: primary) |
 | `-t, --tolerance <HZ>` | Maximum distance between requested and chosen rate (default: `0.5`) |
@@ -136,9 +147,11 @@ freqflip --list
 | `--no-tray` | No tray icon |
 | `--log <FILE>` | Append progress messages to a file |
 | `-b, --backend <NAME>` | Linux only: `auto`, `x11`, `gnome`, `kde`, `wlr` |
-| `-l, --list` | List displays and the rates available at their current resolution |
+| `-l, --list` | List displays with their resolutions and refresh rates |
 
-**Exit code:** `0` once the rate is switched (or already was right), `1` if it couldn't be switched. Errors are printed to stderr, so a script can bail out before starting the game.
+**Modes:** without a resolution, the current one is kept and only the refresh rate changes. Without a rate, FreqFlip picks the one closest to the current rate at the new resolution. Color depth (Windows) and HiDPI scaling (macOS) are kept when the new resolution offers them.
+
+**Exit code:** `0` once the mode is switched (or already was right), `1` if it couldn't be switched. Errors are printed to stderr, so a script can bail out before starting the game.
 
 **Names** are matched case-insensitively, with or without `.exe`, against the process name, its executable and its first argument. FreqFlip waits until **no** process with that name is left.
 
@@ -194,12 +207,12 @@ The foreground call only returns after the background copy reports back, so erro
 
 ## 🖥️ Platform support
 
-| Platform | How the rate is switched | Tray |
+| Platform | How the mode is switched | Tray |
 |---|---|---|
-| **Windows** 10/11 | `SetDisplayConfig`, checked against the real signal timing (not saved: a reboot always brings back your normal rate) | Notification area |
-| **macOS** 11+ | Quartz Display Services, "for app only": macOS itself restores the rate when FreqFlip exits | Menu bar |
-| **Linux, X11** | XRandR | StatusNotifierItem |
-| **Linux, GNOME** (Wayland/X11) | Mutter D-Bus API, temporary config (never written to `monitors.xml`) | StatusNotifierItem¹ |
+| **Windows** 10/11 | `SetDisplayConfig`, checked against the real signal timing (not saved: a reboot always brings back your normal mode) | Notification area |
+| **macOS** 11+ | Quartz Display Services, "for app only": macOS itself restores the mode when FreqFlip exits | Menu bar |
+| **Linux, X11** | XRandR; a new resolution resizes the screen like `xrandr` does | StatusNotifierItem |
+| **Linux, GNOME** (Wayland/X11) | Mutter D-Bus API, temporary config (never written to `monitors.xml`); monitors right of or below a resized one move along | StatusNotifierItem¹ |
 | **Linux, KDE Plasma** (Wayland) | `kscreen-doctor` | StatusNotifierItem |
 | **Linux, wlroots** (Sway, Hyprland, labwc, ...) | `wlr-randr` | StatusNotifierItem² |
 
@@ -283,6 +296,6 @@ This software is provided "AS IS" without warranty of any kind, express or impli
 
 - The developers and contributors of this project assume **no liability** for any damages, losses, or issues arising from the use, misuse, or inability to use this software
 - This includes, but is not limited to: hardware damage, data loss, system malfunction, or any other direct or indirect consequences
-- Only switch to refresh rates your display reports as supported; FreqFlip only offers those, but you are responsible for your hardware
+- Only switch to modes your display reports as supported; FreqFlip only offers those, but you are responsible for your hardware
 - By using this software, you acknowledge that you do so at your own risk
 - This project is an independent effort and is not affiliated with or endorsed by any hardware or software manufacturer

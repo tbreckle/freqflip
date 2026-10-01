@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use tray_icon::menu::{Menu, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-use crate::display::format_hz;
+use crate::display::{format_mode, Mode};
 
 const ICON_PNG: &[u8] = include_bytes!("../images/tray.png");
 /// Windows cuts tooltips off at 127 characters.
@@ -30,23 +30,28 @@ pub enum ProcessState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Status {
     pub display: String,
-    pub target: f64,
-    pub original: f64,
-    pub current: f64,
+    pub target: Mode,
+    pub original: Mode,
+    pub current: Mode,
     pub process: ProcessState,
 }
 
 impl Status {
+    /// Modes are shown with their resolution only if the resolution changes.
+    fn format(&self, mode: &Mode) -> String {
+        format_mode(mode, self.target.resolution() != self.original.resolution())
+    }
+
     pub fn target_line(&self) -> String {
-        format!("Target: {}", format_hz(self.target))
+        format!("Target: {}", self.format(&self.target))
     }
 
     pub fn original_line(&self) -> String {
-        format!("Original: {}", format_hz(self.original))
+        format!("Original: {}", self.format(&self.original))
     }
 
     pub fn current_line(&self) -> String {
-        format!("Current: {}", format_hz(self.current))
+        format!("Current: {}", self.format(&self.current))
     }
 
     pub fn process_line(&self) -> String {
@@ -57,7 +62,7 @@ impl Status {
     }
 
     pub fn exit_label(&self) -> String {
-        format!("Restore {} and exit", format_hz(self.original))
+        format!("Restore {} and exit", self.format(&self.original))
     }
 
     pub fn tooltip(&self) -> String {
@@ -148,12 +153,23 @@ impl Tray {
 mod tests {
     use super::*;
 
+    fn mode(width: u32, height: u32, refresh: f64) -> Mode {
+        Mode {
+            id: String::new(),
+            width,
+            height,
+            refresh,
+            interlaced: false,
+            variant: String::new(),
+        }
+    }
+
     fn status() -> Status {
         Status {
             display: "DP-1".into(),
-            target: 60.0,
-            original: 164.956,
-            current: 59.951,
+            target: mode(2560, 1440, 60.0),
+            original: mode(2560, 1440, 164.956),
+            current: mode(2560, 1440, 59.951),
             process: ProcessState::Waiting("mame".into()),
         }
     }
@@ -171,6 +187,17 @@ mod tests {
             pid: 42,
         };
         assert_eq!(s.process_line(), "Watching mame (PID 42)");
+    }
+
+    #[test]
+    fn shows_resolution_when_it_changes() {
+        let mut s = status();
+        s.target = mode(640, 480, 60.0);
+        s.current = mode(640, 480, 59.94);
+        assert_eq!(s.target_line(), "Target: 640x480 @ 60 Hz");
+        assert_eq!(s.original_line(), "Original: 2560x1440 @ 164.96 Hz");
+        assert_eq!(s.current_line(), "Current: 640x480 @ 59.94 Hz");
+        assert_eq!(s.exit_label(), "Restore 2560x1440 @ 164.96 Hz and exit");
     }
 
     #[test]

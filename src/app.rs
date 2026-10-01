@@ -1,4 +1,4 @@
-//! Switches the rate, waits for the process and restores the rate.
+//! Switches the mode, waits for the process and restores the mode.
 
 use std::thread;
 use std::time::Duration;
@@ -7,13 +7,13 @@ use anyhow::{Context, Result};
 
 use crate::backend;
 use crate::cli::Args;
-use crate::display::{format_hz, pick_mode, select_display, Backend, Mode};
+use crate::display::{format_hz, format_mode, pick_mode, select_display, Backend, Mode};
 use crate::event_loop::{self, AppEvent, EventSender, Handler};
 use crate::process::{self, Target, WatchEvent};
 use crate::report::Reporter;
 use crate::tray::{ProcessState, Status, Tray};
 
-/// How often the current rate is read back for the tray.
+/// How often the current mode is read back for the tray.
 const TICK: Duration = Duration::from_secs(2);
 const RESTORE_ATTEMPTS: u32 = 3;
 const RESTORE_RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -27,12 +27,6 @@ pub fn list(args: &Args) -> Result<()> {
         println!("No active displays found.");
     }
     for display in displays {
-        let rates = display
-            .rates()
-            .into_iter()
-            .map(format_hz)
-            .collect::<Vec<_>>()
-            .join(", ");
         println!();
         println!(
             "{} {}{}",
@@ -45,13 +39,36 @@ pub fn list(args: &Args) -> Result<()> {
             display.current.resolution(),
             format_hz(display.current.refresh)
         );
-        println!("    available: {rates}");
+        let current = display.current.resolution();
+        let rows: Vec<(String, Vec<f64>)> = display
+            .resolutions()
+            .into_iter()
+            .map(|resolution| {
+                // At the current resolution, only what can be picked without a resolution.
+                let rates = if resolution == current {
+                    display.rates()
+                } else {
+                    display.rates_at(resolution)
+                };
+                (resolution.to_string(), rates)
+            })
+            .collect();
+        let width = rows.iter().map(|(r, _)| r.len()).max().unwrap_or(0);
+        for (i, (resolution, rates)) in rows.iter().enumerate() {
+            let rates = rates
+                .iter()
+                .map(|&hz| format_hz(hz))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let label = if i == 0 { "available:" } else { "" };
+            println!("    {label:<10} {resolution:<width$}   {rates}");
+        }
     }
     Ok(())
 }
 
 /// A switched display; restores the original mode when dropped, so every early return after
-/// the switch puts the rate back.
+/// the switch puts the mode back.
 struct Flip {
     backend: Box<dyn Backend>,
     display: String,
@@ -163,8 +180,8 @@ impl Handler for App {
 
     fn tick(&mut self) -> bool {
         if let Ok(current) = self.flip.backend.current_mode(&self.flip.display) {
-            if current.refresh != self.status.current {
-                self.status.current = current.refresh;
+            if current != self.status.current {
+                self.status.current = current;
                 self.update_tray();
             }
         }
@@ -172,21 +189,23 @@ impl Handler for App {
     }
 }
 
-/// `freqflip HZ PROCESS`: returns the exit code.
+/// `freqflip MODE PROCESS`: returns the exit code.
 pub fn run(args: &Args, reporter: &Reporter) -> Result<i32> {
-    let hz = args.hz.context("no refresh rate given")?;
+    let request = args.mode.context("no mode given")?;
     let target = Target::parse(args.process.as_deref().context("no process given")?)?;
     process::check(&target)?;
 
     let mut backend = backend::open(args.backend)?;
     let display = select_display(backend.displays()?, args.display.as_deref())?;
-    let mode = pick_mode(&display, hz, args.tolerance)?;
+    let mode = pick_mode(&display, &request, args.tolerance)?;
     let original = display.current.clone();
+    // Resolutions only show up in the messages when they change.
+    let resolution = mode.resolution() != original.resolution();
     if mode == original {
         reporter.ready(&format!(
             "{} already runs at {}, nothing to do",
             display.label(),
-            format_hz(original.refresh)
+            format_mode(&original, request.resolution.is_some())
         ));
         return Ok(0);
     }
@@ -195,7 +214,7 @@ pub fn run(args: &Args, reporter: &Reporter) -> Result<i32> {
         format!(
             "could not switch {} to {}",
             display.label(),
-            format_hz(mode.refresh)
+            format_mode(&mode, resolution)
         )
     })?;
     let mut flip = Flip {
@@ -207,20 +226,19 @@ pub fn run(args: &Args, reporter: &Reporter) -> Result<i32> {
     let current = flip
         .backend
         .current_mode(&display.id)
-        .map(|m| m.refresh)
-        .unwrap_or(mode.refresh);
+        .unwrap_or_else(|_| mode.clone());
     reporter.ready(&format!(
         "{}: {} -> {}, restoring when {} exits",
         display.label(),
-        format_hz(original.refresh),
-        format_hz(current),
+        format_mode(&original, resolution),
+        format_mode(&current, resolution),
         target.label()
     ));
 
     let status = Status {
         display: display.id.clone(),
-        target: mode.refresh,
-        original: original.refresh,
+        target: mode,
+        original,
         current,
         process: match &target {
             Target::Name(name) => ProcessState::Waiting(name.clone()),
@@ -253,11 +271,8 @@ pub fn run(args: &Args, reporter: &Reporter) -> Result<i32> {
     })?;
 
     app.tray = None;
-    reporter.info(&format!(
-        "{}, restoring {}",
-        app.reason,
-        format_hz(app.status.original)
-    ));
+    let original = format_mode(&app.status.original, resolution);
+    reporter.info(&format!("{}, restoring {original}", app.reason));
     match app.flip.restore() {
         Ok(()) => {
             reporter.info("restored");
@@ -265,8 +280,7 @@ pub fn run(args: &Args, reporter: &Reporter) -> Result<i32> {
         }
         Err(e) => {
             let e = e.context(format!(
-                "could not restore {} on {}",
-                format_hz(app.status.original),
+                "could not restore {original} on {}",
                 app.status.display
             ));
             reporter.fail(&e);
